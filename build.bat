@@ -7,6 +7,14 @@ set SERVER_NAME=server
 set CLIENT_SRC=client.cpp
 set SERVER_SRC=server.cpp
 set TRIPLET=x64-mingw-dynamic
+set BUILD_DIR=builds
+
+REM === CREATE BUILD DIRECTORY ===
+if not exist "%BUILD_DIR%" (
+    echo [*] Creating builds directory...
+    mkdir "%BUILD_DIR%"
+    echo [+] Builds directory created.
+)
 
 REM === FIND OR INSTALL VCPKG ===
 echo [*] Checking for vcpkg installation...
@@ -85,7 +93,7 @@ set BIN_PATH=%VCPKG_ROOT%\installed\%TRIPLET%\bin
 REM === BUILD CLIENT ===
 echo.
 echo [*] Building %CLIENT_NAME%.exe ...
-g++ -std=c++17 %CLIENT_SRC% -o %CLIENT_NAME%.exe -I"%INCLUDE_PATH%" -L"%LIB_PATH%" -lssl -lcrypto -lzlib -lws2_32
+g++ -std=c++17 %CLIENT_SRC% -o "%BUILD_DIR%\%CLIENT_NAME%.exe" -I"%INCLUDE_PATH%" -L"%LIB_PATH%" -lssl -lcrypto -lzlib -lws2_32
 if errorlevel 1 (
     echo [!] Client build failed.
     pause
@@ -96,7 +104,7 @@ echo [+] Client build successful.
 REM === BUILD SERVER ===
 echo.
 echo [*] Building %SERVER_NAME%.exe ...
-g++ -std=c++17 %SERVER_SRC% -o %SERVER_NAME%.exe -I"%INCLUDE_PATH%" -L"%LIB_PATH%" -lssl -lcrypto -lzlib -lws2_32
+g++ -std=c++17 %SERVER_SRC% -o "%BUILD_DIR%\%SERVER_NAME%.exe" -I"%INCLUDE_PATH%" -L"%LIB_PATH%" -lssl -lcrypto -lzlib -lws2_32
 if errorlevel 1 (
     echo [!] Server build failed.
     pause
@@ -106,8 +114,8 @@ echo [+] Server build successful.
 
 REM === COPY DLLs ===
 echo.
-echo [*] Copying runtime DLLs ...
-copy "%BIN_PATH%\*.dll" . >nul 2>&1
+echo [*] Copying runtime DLLs to builds directory...
+copy "%BIN_PATH%\*.dll" "%BUILD_DIR%\" >nul 2>&1
 if errorlevel 1 (
     echo [!] Some DLLs may not have been copied.
 ) else (
@@ -117,10 +125,10 @@ if errorlevel 1 (
 REM === DONE ===
 echo.
 echo [+] Build complete!
-echo [*] Built executables:
+echo [*] Built executables in %BUILD_DIR%\:
 echo     - %CLIENT_NAME%.exe
 echo     - %SERVER_NAME%.exe
 echo.
-echo [*] You can now run either executable.
+echo [*] You can now run either executable from the builds directory.
 pause
 endlocal
