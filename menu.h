@@ -43,6 +43,10 @@ private:
         GetConsoleMode(hOut, &dwMode);
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
+        
+        // Add UTF-8 support
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
     }
     
     void clearScreen() {

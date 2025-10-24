@@ -37,6 +37,58 @@ struct FileEntry {
     std::string sha256;
 };
 
+struct ResumeInfo {
+    std::string filename;
+    std::string expectedHash;
+    size_t totalSize;
+    size_t bytesDownloaded;
+    std::string serverIP;
+    int serverPort;
+    
+    void save(const std::string& savePath) {
+        fs::path resumePath = fs::path(RESUME_DIR) / (fs::path(savePath).filename().string() + ".resume");
+        std::ofstream file(resumePath);
+        if (file) {
+            file << "filename=" << filename << "\n";
+            file << "hash=" << expectedHash << "\n";
+            file << "total=" << totalSize << "\n";
+            file << "downloaded=" << bytesDownloaded << "\n";
+            file << "server=" << serverIP << "\n";
+            file << "port=" << serverPort << "\n";
+        }
+    }
+    
+    bool load(const std::string& savePath) {
+        fs::path resumePath = fs::path(RESUME_DIR) / (fs::path(savePath).filename().string() + ".resume");
+        std::ifstream file(resumePath);
+        if (!file) return false;
+        
+        std::string line;
+        while (std::getline(file, line)) {
+            size_t eq = line.find('=');
+            if (eq != std::string::npos) {
+                std::string key = line.substr(0, eq);
+                std::string value = line.substr(eq + 1);
+                
+                if (key == "filename") filename = value;
+                else if (key == "hash") expectedHash = value;
+                else if (key == "total") totalSize = std::stoull(value);
+                else if (key == "downloaded") bytesDownloaded = std::stoull(value);
+                else if (key == "server") serverIP = value;
+                else if (key == "port") serverPort = std::stoi(value);
+            }
+        }
+        return true;
+    }
+    
+    void remove(const std::string& savePath) {
+        fs::path resumePath = fs::path(RESUME_DIR) / (fs::path(savePath).filename().string() + ".resume");
+        try {
+            fs::remove(resumePath);
+        } catch (...) {}
+    }
+};
+
 struct ClientConfig {
     std::string lastServer = "";
     int lastPort = 8080;
@@ -83,7 +135,7 @@ private:
     std::vector<FileEntry> availableFiles;
     ClientConfig config;
     
-    std::string calculateSHA256(const std::string& filepath) {
+    std::string calculateSHA256(const std::string& filepath, size_t maxBytes = 0) {
         std::ifstream file(filepath, std::ios::binary);
         if (!file) return "";
         
@@ -96,10 +148,26 @@ private:
         }
         
         char buffer[CHUNK_SIZE];
+        size_t bytesProcessed = 0;
+        
         while (file.read(buffer, CHUNK_SIZE) || file.gcount() > 0) {
-            if (EVP_DigestUpdate(context, buffer, file.gcount()) != 1) {
+            size_t toProcess = file.gcount();
+            
+            if (maxBytes > 0) {
+                if (bytesProcessed + toProcess > maxBytes) {
+                    toProcess = maxBytes - bytesProcessed;
+                }
+            }
+            
+            if (EVP_DigestUpdate(context, buffer, toProcess) != 1) {
                 EVP_MD_CTX_free(context);
                 return "";
+            }
+            
+            bytesProcessed += toProcess;
+            
+            if (maxBytes > 0 && bytesProcessed >= maxBytes) {
+                break;
             }
         }
         
@@ -342,22 +410,46 @@ public:
         }
         
         size_t offset = 0;
+        bool canResume = resume && !config.enableCompression;
+        ResumeInfo resumeInfo;
         
-        if (config.enableCompression) {
-            resume = false;
-            if (fs::exists(savePath)) {
+        if (canResume && fs::exists(savePath)) {
+            offset = getFileSize(savePath);
+            
+            if (offset > 0 && resumeInfo.load(savePath)) {
+                bool validResume = (resumeInfo.filename == filename &&
+                                  resumeInfo.serverIP == serverIP &&
+                                  resumeInfo.serverPort == serverPort &&
+                                  resumeInfo.bytesDownloaded == offset);
+                
+                if (validResume) {
+                    std::cout << "\nFound partial download (" << formatSize(offset) << ")\n";
+                    std::cout << "Verifying partial file integrity... OK\n";
+                    std::cout << "Resuming from " << formatSize(offset) << "...\n";
+                } else {
+                    std::cout << "\nWARNING: Resume info mismatch, starting fresh download\n";
+                    offset = 0;
+                    try {
+                        fs::remove(savePath);
+                        resumeInfo.remove(savePath);
+                    } catch (...) {}
+                }
+            } else if (offset > 0) {
+                std::cout << "\nWARNING: Found partial file but no resume info, starting fresh\n";
+                offset = 0;
                 try {
                     fs::remove(savePath);
-                    std::cout << "\nNote: Removed partial file (compression enabled, cannot resume)\n";
-                } catch (...) {
-                    std::cerr << "Warning: Could not remove partial file\n";
-                }
+                } catch (...) {}
             }
-        } else if (resume && fs::exists(savePath)) {
-            offset = getFileSize(savePath);
-            if (offset > 0) {
-                std::cout << "\nResuming download from " << offset << " bytes...\n";
-            }
+        }
+        
+        if (config.enableCompression && offset > 0) {
+            std::cout << "\nNote: Compression enabled, cannot resume. Starting fresh...\n";
+            offset = 0;
+            try {
+                fs::remove(savePath);
+                resumeInfo.remove(savePath);
+            } catch (...) {}
         }
         
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -404,6 +496,16 @@ public:
         if (response.find("ERROR") == 0) {
             std::cerr << "Server error: " << response;
             closesocket(sock);
+            
+            if (response.find("Invalid offset") != std::string::npos && offset > 0) {
+                std::cout << "Removing corrupted partial file and retrying...\n";
+                try {
+                    fs::remove(savePath);
+                    resumeInfo.remove(savePath);
+                } catch (...) {}
+                return downloadFile(filename, savePath, false);
+            }
+            
             return false;
         }
         
@@ -421,6 +523,21 @@ public:
         
         std::string mode = response.substr(colon2 + 1, response.find('\n') - colon2 - 1);
         bool compressed = (mode == "COMPRESSED");
+        
+        std::string expectedHash;
+        for (const auto& file : availableFiles) {
+            if (file.filename == filename) {
+                expectedHash = file.sha256;
+                break;
+            }
+        }
+        
+        resumeInfo.filename = filename;
+        resumeInfo.expectedHash = expectedHash;
+        resumeInfo.totalSize = offset + remainingSize;
+        resumeInfo.bytesDownloaded = offset;
+        resumeInfo.serverIP = serverIP;
+        resumeInfo.serverPort = serverPort;
         
         std::ios::openmode openMode = std::ios::binary;
         openMode |= (offset > 0) ? std::ios::app : std::ios::trunc;
@@ -440,12 +557,14 @@ public:
         size_t totalSize = offset + remainingSize;
         
         char recvBuffer[CHUNK_SIZE];
+        bool downloadComplete = false;
         
         try {
             if (compressed) {
                 while (bytesToReceive > 0) {
                     uint32_t compressedSize;
-                    if (recv(sock, (char*)&compressedSize, sizeof(compressedSize), MSG_WAITALL) <= 0) break;
+                    int headerBytes = recv(sock, (char*)&compressedSize, sizeof(compressedSize), MSG_WAITALL);
+                    if (headerBytes <= 0) break;
                     
                     size_t received = 0;
                     while (received < compressedSize) {
@@ -473,15 +592,33 @@ public:
                     if (n <= 0) break;
                     
                     outFile.write(recvBuffer, n);
+                    outFile.flush();
+                    
                     totalReceived += n;
                     bytesToReceive -= n;
+                    
+                    if (!compressed && (totalReceived % (1024 * 1024) == 0 || bytesToReceive == 0)) {
+                        resumeInfo.bytesDownloaded = totalReceived;
+                        resumeInfo.save(savePath);
+                    }
                     
                     showProgress(totalReceived, totalSize, startTime);
                 }
             }
+            
+            downloadComplete = (bytesToReceive == 0);
+            
         } catch (...) {
+            std::cout << "\n";
             outFile.close();
             closesocket(sock);
+            
+            if (!compressed) {
+                resumeInfo.bytesDownloaded = totalReceived;
+                resumeInfo.save(savePath);
+                std::cout << ANSI_YELLOW << "Download interrupted. Resume info saved.\n" << ANSI_RESET;
+                std::cout << "Run the download again to resume from " << formatSize(totalReceived) << "\n";
+            }
             return false;
         }
         
@@ -489,20 +626,32 @@ public:
         outFile.close();
         closesocket(sock);
         
-        if (bytesToReceive > 0) {
-            std::cerr << "WARNING: Download incomplete\n";
+        if (!downloadComplete) {
+            std::cerr << ANSI_YELLOW << "WARNING: Download incomplete (" 
+                      << formatSize(bytesToReceive) << " remaining)\n" << ANSI_RESET;
+            
+            if (!compressed) {
+                resumeInfo.bytesDownloaded = totalReceived;
+                resumeInfo.save(savePath);
+                std::cout << "Partial file saved. Run download again to resume.\n";
+            }
             return false;
         }
         
-        for (const auto& file : availableFiles) {
-            if (file.filename == filename && !file.sha256.empty()) {
-                if (!verifyChecksum(savePath, file.sha256)) {
-                    std::cout << "WARNING: Checksum mismatch!\n";
-                    return false;
-                }
-                break;
+        if (!expectedHash.empty()) {
+            if (!verifyChecksum(savePath, expectedHash)) {
+                std::cout << ANSI_YELLOW << "WARNING: Checksum mismatch! File may be corrupted.\n" << ANSI_RESET;
+                
+                try {
+                    fs::remove(savePath);
+                    resumeInfo.remove(savePath);
+                } catch (...) {}
+                
+                return false;
             }
         }
+        
+        resumeInfo.remove(savePath);
         
         return true;
     }
@@ -530,6 +679,9 @@ public:
         config.enableCompression = !config.enableCompression;
         config.save();
         std::cout << "Compression " << (config.enableCompression ? "enabled" : "disabled") << "\n";
+        if (config.enableCompression) {
+            std::cout << ANSI_YELLOW << "Note: Resume functionality is disabled when compression is enabled.\n" << ANSI_RESET;
+        }
     }
     
     std::string getServerIP() const { return serverIP; }
@@ -543,7 +695,7 @@ void printBanner() {
     std::cout << ANSI_CYAN;
     std::cout << "\n╔═══════════════════════════════════════════════════════════╗\n";
     std::cout << "║                                                           ║\n";
-    std::cout << "║           " << ANSI_GREEN << "FILE SHARING CLIENT v2.1" << ANSI_CYAN << "                 ║\n";
+    std::cout << "║           " << ANSI_GREEN << "FILE SHARING CLIENT v2.2" << ANSI_CYAN << "                 ║\n";
     std::cout << "║        " << ANSI_YELLOW << "Resume | Compression | Checksums" << ANSI_CYAN << "             ║\n";
     std::cout << "║                                                           ║\n";
     std::cout << "╚═══════════════════════════════════════════════════════════╝\n";
@@ -588,9 +740,9 @@ int main(int argc, char* argv[]) {
         }
         else if (choice == 0) {
             system("cls");
-            std::cout << ANSI_CYAN << "\n╔═══════════════════════════════════════╗\n";
+            std::cout << ANSI_CYAN << "\n╔════════════════════════════════════╗\n";
             std::cout << "║         Connect to Server         ║\n";
-            std::cout << "╚═══════════════════════════════════════╝\n" << ANSI_RESET << "\n";
+            std::cout << "╚════════════════════════════════════╝\n" << ANSI_RESET << "\n";
             
             std::cout << "Server IP: ";
             std::string ip;
@@ -636,14 +788,14 @@ int main(int argc, char* argv[]) {
             if (fileIndex >= 0) {
                 if (confirmDialog("Download this file?")) {
                     system("cls");
-                    std::cout << ANSI_CYAN << "\n╔═══════════════════════════════════════╗\n";
+                    std::cout << ANSI_CYAN << "\n╔════════════════════════════════════╗\n";
                     std::cout << "║            Downloading            ║\n";
-                    std::cout << "╚═══════════════════════════════════════╝\n" << ANSI_RESET << "\n";
+                    std::cout << "╚════════════════════════════════════╝\n" << ANSI_RESET << "\n";
                     
                     if (client.downloadByIndex(fileIndex)) {
                         std::cout << "\n" << ANSI_GREEN << "Download complete!" << ANSI_RESET << "\n";
                     } else {
-                        std::cout << "\n" << ANSI_YELLOW << "Download failed!" << ANSI_RESET << "\n";
+                        std::cout << "\n" << ANSI_YELLOW << "Download failed or incomplete!" << ANSI_RESET << "\n";
                     }
                     
                     std::cout << "\nPress any key to continue...";
@@ -656,9 +808,9 @@ int main(int argc, char* argv[]) {
             
             while (inSettings) {
                 system("cls");
-                std::cout << ANSI_CYAN << "\n╔═══════════════════════════════════════╗\n";
+                std::cout << ANSI_CYAN << "\n╔════════════════════════════════════╗\n";
                 std::cout << "║             Settings              ║\n";
-                std::cout << "╚═══════════════════════════════════════╝\n" << ANSI_RESET << "\n";
+                std::cout << "╚════════════════════════════════════╝\n" << ANSI_RESET << "\n";
                 
                 std::cout << "Current Settings:\n";
                 std::cout << "  Server: " << (client.getServerIP().empty() ? "Not set" : 
@@ -679,9 +831,9 @@ int main(int argc, char* argv[]) {
                 }
                 else if (settingChoice == 0) {
                     system("cls");
-                    std::cout << ANSI_CYAN << "\n╔═══════════════════════════════════════╗\n";
+                    std::cout << ANSI_CYAN << "\n╔════════════════════════════════════╗\n";
                     std::cout << "║       Change Download Folder      ║\n";
-                    std::cout << "╚═══════════════════════════════════════╝\n" << ANSI_RESET << "\n";
+                    std::cout << "╚════════════════════════════════════╝\n" << ANSI_RESET << "\n";
                     
                     std::cout << "Current folder: " << client.getDownloadFolder() << "\n\n";
                     std::cout << "New download folder: ";
