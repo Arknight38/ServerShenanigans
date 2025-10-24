@@ -1,1 +1,4 @@
+vcpkg/
+.vscode/
 build/
+*.dll
