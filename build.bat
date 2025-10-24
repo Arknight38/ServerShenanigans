@@ -9,6 +9,12 @@ set SERVER_SRC=server.cpp
 set TRIPLET=x64-mingw-dynamic
 set BUILD_DIR=builds
 
+echo.
+echo ========================================
+echo   FILE SHARING -  BUILDING
+echo ========================================
+echo.
+
 REM === CREATE BUILD DIRECTORY ===
 if not exist "%BUILD_DIR%" (
     echo [*] Creating builds directory...
@@ -92,7 +98,7 @@ set BIN_PATH=%VCPKG_ROOT%\installed\%TRIPLET%\bin
 
 REM === BUILD CLIENT ===
 echo.
-echo [*] Building %CLIENT_NAME%.exe ...
+echo [*] Building %CLIENT_NAME%.exe...
 g++ -std=c++17 %CLIENT_SRC% -o "%BUILD_DIR%\%CLIENT_NAME%.exe" -I"%INCLUDE_PATH%" -L"%LIB_PATH%" -lssl -lcrypto -lzlib -lws2_32
 if errorlevel 1 (
     echo [!] Client build failed.
@@ -112,6 +118,16 @@ if errorlevel 1 (
 )
 echo [+] Server build successful.
 
+REM === COPY MENU HEADER ===
+echo.
+echo [*] Copying menu.h to builds directory...
+copy menu.h "%BUILD_DIR%\" >nul 2>&1
+if errorlevel 1 (
+    echo [!] Warning: menu.h not copied (not needed for executables, only for development)
+) else (
+    echo [+] menu.h copied.
+)
+
 REM === COPY DLLs ===
 echo.
 echo [*] Copying runtime DLLs to builds directory...
@@ -124,11 +140,22 @@ if errorlevel 1 (
 
 REM === DONE ===
 echo.
-echo [+] Build complete!
-echo [*] Built executables in %BUILD_DIR%\:
-echo     - %CLIENT_NAME%.exe
-echo     - %SERVER_NAME%.exe
+echo ========================================
+echo [+] BUILD COMPLETE!
+echo ========================================
 echo.
-echo [*] You can now run either executable from the builds directory.
+echo Built executables in %BUILD_DIR%\:
+echo   - %CLIENT_NAME%.exe
+echo   - %SERVER_NAME%.exe
+echo.
+echo New Features:
+echo   - Arrow key navigation
+echo   - Interactive file browser
+echo   - Built-in search (press '/' in menus)
+echo   - Color-coded interface
+echo   - Smooth scrolling
+echo.
+echo You can now run either executable from the builds directory.
+echo.
 pause
 endlocal

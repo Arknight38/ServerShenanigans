@@ -18,13 +18,16 @@
 #include <openssl/sha.h>
 #include <openssl/evp.h>
 
+// Include our menu system
+#include "menu.h"
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "zlib.lib")
 #pragma comment(lib, "libcrypto.lib")
 
 namespace fs = std::filesystem;
 
-const int CHUNK_SIZE = 65536; // 64KB
+const int CHUNK_SIZE = 65536;
 const std::string CONFIG_FILE = "client_config.txt";
 const std::string RESUME_DIR = ".resume";
 
@@ -118,8 +121,7 @@ private:
         return ss.str();
     }
     
-    std::vector<char> decompressData(const char* data, size_t compressedSize, 
-                                    size_t originalSize) {
+    std::vector<char> decompressData(const char* data, size_t compressedSize, size_t originalSize) {
         std::vector<char> decompressed(originalSize);
         uLongf destLen = originalSize;
         
@@ -137,8 +139,7 @@ private:
         return file.tellg();
     }
     
-    void showProgress(size_t current, size_t total, 
-                     std::chrono::steady_clock::time_point startTime) {
+    void showProgress(size_t current, size_t total, std::chrono::steady_clock::time_point startTime) {
         double percent = (total > 0) ? (100.0 * current / total) : 0;
         
         auto now = std::chrono::steady_clock::now();
@@ -159,6 +160,20 @@ private:
                   << std::setprecision(2) << speed << " MB/s " << std::flush;
     }
     
+    std::string formatSize(size_t bytes) {
+        std::stringstream ss;
+        if (bytes < 1024) {
+            ss << bytes << " B";
+        } else if (bytes < 1024 * 1024) {
+            ss << std::fixed << std::setprecision(2) << (bytes / 1024.0) << " KB";
+        } else if (bytes < 1024 * 1024 * 1024) {
+            ss << std::fixed << std::setprecision(2) << (bytes / (1024.0 * 1024.0)) << " MB";
+        } else {
+            ss << std::fixed << std::setprecision(2) << (bytes / (1024.0 * 1024.0 * 1024.0)) << " GB";
+        }
+        return ss.str();
+    }
+    
 public:
     FileClient() : wsaInitialized(false), serverPort(8080) {
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -171,18 +186,14 @@ public:
         serverIP = config.lastServer;
         serverPort = config.lastPort;
         
-        // Ensure download folder exists
         if (config.downloadFolder.empty() || config.downloadFolder == ".") {
             config.downloadFolder = fs::current_path().string();
         }
         
-        // Create directories
         try {
             fs::create_directories(config.downloadFolder);
             fs::create_directories(RESUME_DIR);
-        } catch (...) {
-            // Ignore errors, will be caught during download
-        }
+        } catch (...) {}
     }
     
     ~FileClient() {
@@ -261,7 +272,6 @@ public:
                     continue;
                 }
                 
-                // Format: filename:size:sha256
                 size_t colon1 = line.find(':');
                 size_t colon2 = line.find(':', colon1 + 1);
                 
@@ -291,34 +301,23 @@ public:
         return false;
     }
     
-    void displayFiles() {
+    int showFileMenu() {
         if (availableFiles.empty()) {
-            std::cout << "\nNo files available.\n";
-            return;
+            std::cout << "\nNo files available. Connect to server and refresh file list.\n";
+            std::cout << "Press any key to continue...";
+            _getch();
+            return -1;
         }
         
-        std::cout << "\n========================================\n";
-        std::cout << "Available Files (" << availableFiles.size() << " total)\n";
-        std::cout << "========================================\n";
+        Menu fileMenu("Available Files - " + serverIP + ":" + std::to_string(serverPort), 12);
         
-        for (size_t i = 0; i < availableFiles.size(); i++) {
-            std::cout << "[" << (i + 1) << "] " << availableFiles[i].filename;
-            
-            double size = availableFiles[i].filesize;
-            if (size < 1024) {
-                std::cout << " (" << size << " B)";
-            } else if (size < 1024 * 1024) {
-                std::cout << " (" << std::fixed << std::setprecision(2) 
-                         << (size / 1024.0) << " KB)";
-            } else {
-                std::cout << " (" << std::fixed << std::setprecision(2) 
-                         << (size / (1024.0 * 1024.0)) << " MB)";
-            }
-            
-            std::cout << "\n    SHA256: " << availableFiles[i].sha256.substr(0, 16) << "...\n";
+        for (const auto& file : availableFiles) {
+            std::string desc = formatSize(file.filesize) + " - SHA256: " + 
+                             file.sha256.substr(0, 16) + "...";
+            fileMenu.addItem(file.filename, desc);
         }
         
-        std::cout << "========================================\n";
+        return fileMenu.show();
     }
     
     bool verifyChecksum(const std::string& filepath, const std::string& expectedHash) {
@@ -336,20 +335,16 @@ public:
         }
     }
     
-    bool downloadFile(const std::string& filename, const std::string& savePath, 
-                     bool resume = true) {
+    bool downloadFile(const std::string& filename, const std::string& savePath, bool resume = true) {
         if (!wsaInitialized) {
             std::cerr << "ERROR: Winsock not initialized\n";
             return false;
         }
         
-        // Check if partial file exists
         size_t offset = 0;
         
-        // Disable resume when compression is enabled
         if (config.enableCompression) {
             resume = false;
-            // Delete partial file if it exists
             if (fs::exists(savePath)) {
                 try {
                     fs::remove(savePath);
@@ -367,7 +362,7 @@ public:
         
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock == INVALID_SOCKET) {
-            std::cerr << "ERROR: Socket creation failed: " << WSAGetLastError() << "\n";
+            std::cerr << "ERROR: Socket creation failed\n";
             return false;
         }
         
@@ -376,44 +371,29 @@ public:
         serverAddr.sin_port = htons(serverPort);
         
         if (inet_pton(AF_INET, serverIP.c_str(), &serverAddr.sin_addr) <= 0) {
-            std::cerr << "ERROR: Invalid IP address: " << serverIP << "\n";
+            std::cerr << "ERROR: Invalid IP address\n";
             closesocket(sock);
             return false;
         }
         
         if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-            std::cerr << "ERROR: Connection failed: " << WSAGetLastError() << "\n";
-            std::cerr << "       Make sure server is running at " << serverIP << ":" << serverPort << "\n";
+            std::cerr << "ERROR: Connection failed\n";
             closesocket(sock);
             return false;
         }
         
-        // Build request with resume support
         std::stringstream request;
         request << "GET " << filename;
-        if (offset > 0) {
-            request << " OFFSET " << offset;
-        }
-        if (config.enableCompression) {
-            request << " COMPRESS";
-        }
+        if (offset > 0) request << " OFFSET " << offset;
+        if (config.enableCompression) request << " COMPRESS";
         
         std::string reqStr = request.str();
-        std::cout << "Sending request: " << reqStr << "\n";
+        send(sock, reqStr.c_str(), (int)reqStr.length(), 0);
         
-        int sentBytes = send(sock, reqStr.c_str(), (int)reqStr.length(), 0);
-        if (sentBytes == SOCKET_ERROR) {
-            std::cerr << "ERROR: Failed to send request: " << WSAGetLastError() << "\n";
-            closesocket(sock);
-            return false;
-        }
-        
-        // Receive response header
         char buffer[1024];
         int bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0);
         if (bytesRead <= 0) {
-            std::cerr << "ERROR: No response from server (recv returned " << bytesRead << ")\n";
-            std::cerr << "       Error code: " << WSAGetLastError() << "\n";
+            std::cerr << "ERROR: No response from server\n";
             closesocket(sock);
             return false;
         }
@@ -421,64 +401,38 @@ public:
         buffer[bytesRead] = '\0';
         std::string response(buffer);
         
-        std::cout << "Server response: " << response.substr(0, 50) << "...\n";
-        
         if (response.find("ERROR") == 0) {
             std::cerr << "Server error: " << response;
             closesocket(sock);
             return false;
         }
         
-        // Parse: OK:size:mode
         if (response.find("OK:") != 0) {
-            std::cerr << "ERROR: Unexpected response format: " << response.substr(0, 30) << "\n";
+            std::cerr << "ERROR: Unexpected response format\n";
             closesocket(sock);
             return false;
         }
         
         size_t colon1 = response.find(':');
         size_t colon2 = response.find(':', colon1 + 1);
-        size_t newline = response.find('\n');
-        
-        if (colon1 == std::string::npos || colon2 == std::string::npos) {
-            std::cerr << "ERROR: Failed to parse response header\n";
-            closesocket(sock);
-            return false;
-        }
         
         std::string sizeStr = response.substr(colon1 + 1, colon2 - colon1 - 1);
-        size_t remainingSize = 0;
-        try {
-            remainingSize = std::stoull(sizeStr);
-        } catch (...) {
-            std::cerr << "ERROR: Invalid file size in response: " << sizeStr << "\n";
-            closesocket(sock);
-            return false;
-        }
+        size_t remainingSize = std::stoull(sizeStr);
         
-        std::string mode = response.substr(colon2 + 1, newline - colon2 - 1);
+        std::string mode = response.substr(colon2 + 1, response.find('\n') - colon2 - 1);
         bool compressed = (mode == "COMPRESSED");
         
-        std::cout << "File size: " << remainingSize << " bytes, Mode: " << mode << "\n";
-        
-        // Open file for writing
         std::ios::openmode openMode = std::ios::binary;
-        if (offset > 0) {
-            openMode |= std::ios::app;
-        } else {
-            openMode |= std::ios::trunc;
-        }
+        openMode |= (offset > 0) ? std::ios::app : std::ios::trunc;
         
         std::ofstream outFile(savePath, openMode);
         if (!outFile) {
-            std::cerr << "ERROR: Cannot create file: " << savePath << "\n";
-            std::cerr << "       Check folder permissions and disk space\n";
+            std::cerr << "ERROR: Cannot create file\n";
             closesocket(sock);
             return false;
         }
         
-        std::cout << "\nDownloading " << filename << " (" 
-                  << (compressed ? "compressed" : "raw") << ")...\n";
+        std::cout << "\nDownloading " << filename << "...\n";
         
         auto startTime = std::chrono::steady_clock::now();
         size_t totalReceived = offset;
@@ -490,107 +444,60 @@ public:
         try {
             if (compressed) {
                 while (bytesToReceive > 0) {
-                    // Receive compressed chunk size
                     uint32_t compressedSize;
-                    int sizeRead = recv(sock, (char*)&compressedSize, sizeof(compressedSize), MSG_WAITALL);
-                    if (sizeRead <= 0) {
-                        std::cerr << "\nERROR: Connection lost while receiving chunk size\n";
-                        break;
-                    }
+                    if (recv(sock, (char*)&compressedSize, sizeof(compressedSize), MSG_WAITALL) <= 0) break;
                     
-                    // Receive compressed data
                     size_t received = 0;
                     while (received < compressedSize) {
                         int n = recv(sock, recvBuffer + received, 
                                    std::min((size_t)CHUNK_SIZE - received, compressedSize - received), 0);
-                        if (n <= 0) {
-                            std::cerr << "\nERROR: Connection lost while receiving data\n";
-                            break;
-                        }
+                        if (n <= 0) break;
                         received += n;
                     }
                     
                     if (received < compressedSize) break;
                     
-                    // Decompress
                     std::vector<char> decompressed = decompressData(recvBuffer, received, CHUNK_SIZE);
-                    if (decompressed.empty()) {
-                        std::cerr << "\nERROR: Decompression failed\n";
-                        break;
-                    }
+                    if (decompressed.empty()) break;
                     
                     outFile.write(decompressed.data(), decompressed.size());
-                    if (!outFile) {
-                        std::cerr << "\nERROR: Failed to write to file\n";
-                        break;
-                    }
-                    
                     totalReceived += decompressed.size();
-                    
-                    // For compressed mode, decrement based on decompressed size
-                    if (bytesToReceive >= decompressed.size()) {
-                        bytesToReceive -= decompressed.size();
-                    } else {
-                        bytesToReceive = 0;
-                    }
+                    bytesToReceive = (bytesToReceive >= decompressed.size()) ? 
+                                    bytesToReceive - decompressed.size() : 0;
                     
                     showProgress(totalReceived, totalSize, startTime);
                 }
             } else {
                 while (bytesToReceive > 0) {
-                    int n = recv(sock, recvBuffer, 
-                               std::min((size_t)CHUNK_SIZE, bytesToReceive), 0);
-                    if (n <= 0) {
-                        if (n == 0) {
-                            std::cerr << "\nWARNING: Connection closed by server\n";
-                        } else {
-                            std::cerr << "\nERROR: Receive failed: " << WSAGetLastError() << "\n";
-                        }
-                        break;
-                    }
+                    int n = recv(sock, recvBuffer, std::min((size_t)CHUNK_SIZE, bytesToReceive), 0);
+                    if (n <= 0) break;
                     
                     outFile.write(recvBuffer, n);
-                    if (!outFile) {
-                        std::cerr << "\nERROR: Failed to write to file\n";
-                        break;
-                    }
-                    
                     totalReceived += n;
                     bytesToReceive -= n;
                     
                     showProgress(totalReceived, totalSize, startTime);
                 }
             }
-        } catch (const std::exception& e) {
-            std::cerr << "\nEXCEPTION: " << e.what() << "\n";
+        } catch (...) {
             outFile.close();
             closesocket(sock);
             return false;
         }
         
         std::cout << "\n";
-        
         outFile.close();
         closesocket(sock);
         
         if (bytesToReceive > 0) {
-            std::cerr << "WARNING: Download incomplete (" << bytesToReceive << " bytes remaining)\n";
-            if (!compressed) {
-                std::cerr << "         Run download again to resume\n";
-            } else {
-                std::cerr << "         Compression is enabled - cannot resume. Try again from start.\n";
-            }
+            std::cerr << "WARNING: Download incomplete\n";
             return false;
         }
         
-        std::cout << "Downloaded: " << totalReceived << " bytes\n";
-        std::cout << "Saved to: " << savePath << "\n";
-        
-        // Verify checksum if available
         for (const auto& file : availableFiles) {
             if (file.filename == filename && !file.sha256.empty()) {
                 if (!verifyChecksum(savePath, file.sha256)) {
-                    std::cout << "WARNING: Checksum mismatch! File may be corrupted.\n";
+                    std::cout << "WARNING: Checksum mismatch!\n";
                     return false;
                 }
                 break;
@@ -601,13 +508,9 @@ public:
     }
     
     bool downloadByIndex(int index) {
-        if (index < 1 || index > (int)availableFiles.size()) {
-            return false;
-        }
+        if (index < 0 || index >= (int)availableFiles.size()) return false;
         
-        const FileEntry& file = availableFiles[index - 1];
-        
-        // Use filesystem to properly construct path
+        const FileEntry& file = availableFiles[index];
         fs::path downloadPath = fs::path(config.downloadFolder) / file.filename;
         return downloadFile(file.filename, downloadPath.string());
     }
@@ -616,182 +519,194 @@ public:
         config.downloadFolder = folder;
         config.save();
         
-        // Create directory if it doesn't exist
         try {
             if (!fs::exists(folder)) {
                 fs::create_directories(folder);
-                std::cout << "Created download folder: " << folder << "\n";
             }
-        } catch (const std::exception& e) {
-            std::cerr << "Warning: Could not create folder: " << e.what() << "\n";
-        }
+        } catch (...) {}
     }
     
     void toggleCompression() {
         config.enableCompression = !config.enableCompression;
         config.save();
-        std::cout << "Compression " 
-                  << (config.enableCompression ? "enabled" : "disabled") << "\n";
-        if (config.enableCompression) {
-            std::cout << "Note: Resume is disabled when compression is enabled.\n";
-        }
+        std::cout << "Compression " << (config.enableCompression ? "enabled" : "disabled") << "\n";
     }
     
     std::string getServerIP() const { return serverIP; }
     int getServerPort() const { return serverPort; }
     bool isCompressionEnabled() const { return config.enableCompression; }
+    std::string getDownloadFolder() const { return config.downloadFolder; }
 };
 
 void printBanner() {
-    std::cout << "\n========================================\n";
-    std::cout << "    FILE SHARING CLIENT v2.0\n";
-    std::cout << "  Resume | Compression | Checksums\n";
-    std::cout << "========================================\n";
-}
-
-void printMenu() {
-    std::cout << "\n--- MENU ---\n";
-    std::cout << "1. Connect to server\n";
-    std::cout << "2. List available files\n";
-    std::cout << "3. Download file by number\n";
-    std::cout << "4. Download file by name\n";
-    std::cout << "5. Set download folder\n";
-    std::cout << "6. Toggle compression\n";
-    std::cout << "7. Show settings\n";
-    std::cout << "8. Exit\n";
-    std::cout << "\nChoice: ";
+    system("cls");
+    std::cout << ANSI_CYAN;
+    std::cout << "\n╔═══════════════════════════════════════════════════════════╗\n";
+    std::cout << "║                                                           ║\n";
+    std::cout << "║           " << ANSI_GREEN << "FILE SHARING CLIENT v2.1" << ANSI_CYAN << "                 ║\n";
+    std::cout << "║        " << ANSI_YELLOW << "Resume | Compression | Checksums" << ANSI_CYAN << "             ║\n";
+    std::cout << "║                                                           ║\n";
+    std::cout << "╚═══════════════════════════════════════════════════════════╝\n";
+    std::cout << ANSI_RESET << "\n";
 }
 
 int main(int argc, char* argv[]) {
     FileClient client;
-    printBanner();
     
     if (argc >= 3) {
         client.setServer(argv[1], std::stoi(argv[2]));
-        std::cout << "Server: " << argv[1] << ":" << argv[2] << "\n";
-        
-        std::cout << "Testing... ";
-        if (client.testConnection()) {
-            std::cout << "Connected!\n";
-        } else {
-            std::cout << "Failed.\n";
-        }
-    } else if (!client.getServerIP().empty()) {
-        std::cout << "Last server: " << client.getServerIP() 
-                  << ":" << client.getServerPort() << "\n";
     }
     
     bool running = true;
     
     while (running) {
-        printMenu();
+        printBanner();
         
-        int choice;
-        std::cin >> choice;
-        std::cin.ignore();
+        if (!client.getServerIP().empty()) {
+            std::cout << ANSI_GREEN << "  Connected to: " << ANSI_RESET 
+                      << client.getServerIP() << ":" << client.getServerPort() << "\n";
+        } else {
+            std::cout << ANSI_YELLOW << "  Not connected to any server" << ANSI_RESET << "\n";
+        }
         
-        switch (choice) {
-            case 1: {
-                std::cout << "\nServer IP: ";
-                std::string ip;
-                std::getline(std::cin, ip);
-                
-                std::cout << "Port [8080]: ";
-                std::string portStr;
-                std::getline(std::cin, portStr);
-                int port = portStr.empty() ? 8080 : std::stoi(portStr);
-                
-                client.setServer(ip, port);
-                
-                std::cout << "\nTesting... ";
-                if (client.testConnection()) {
-                    std::cout << "Success!\n";
-                } else {
-                    std::cout << "Failed!\n";
-                }
-                break;
-            }
-            
-            case 2: {
-                if (client.getServerIP().empty()) {
-                    std::cout << "\nConnect to server first!\n";
-                    break;
-                }
-                
-                std::cout << "\nRefreshing...\n";
-                if (client.listFiles()) {
-                    client.displayFiles();
-                } else {
-                    std::cout << "Failed to get file list.\n";
-                }
-                break;
-            }
-            
-            case 3: {
-                std::cout << "\nFile number: ";
-                int num;
-                std::cin >> num;
-                std::cin.ignore();
-                
-                if (client.downloadByIndex(num)) {
-                    std::cout << "\nDownload complete!\n";
-                } else {
-                    std::cout << "\nDownload failed.\n";
-                }
-                break;
-            }
-            
-            case 4: {
-                std::cout << "\nFilename: ";
-                std::string filename;
-                std::getline(std::cin, filename);
-                
-                std::cout << "Save as [" << filename << "]: ";
-                std::string saveName;
-                std::getline(std::cin, saveName);
-                if (saveName.empty()) saveName = filename;
-                
-                if (client.downloadFile(filename, saveName)) {
-                    std::cout << "\nDownload complete!\n";
-                } else {
-                    std::cout << "\nDownload failed.\n";
-                }
-                break;
-            }
-            
-            case 5: {
-                std::cout << "\nDownload folder: ";
-                std::string folder;
-                std::getline(std::cin, folder);
-                client.setDownloadFolder(folder);
-                std::cout << "Folder set to: " << folder << "\n";
-                break;
-            }
-            
-            case 6: {
-                client.toggleCompression();
-                break;
-            }
-            
-            case 7: {
-                std::cout << "\n--- SETTINGS ---\n";
-                std::cout << "Server: " << client.getServerIP() 
-                         << ":" << client.getServerPort() << "\n";
-                std::cout << "Compression: " 
-                         << (client.isCompressionEnabled() ? "ON" : "OFF") << "\n";
-                break;
-            }
-            
-            case 8: {
-                std::cout << "\nGoodbye!\n";
+        std::cout << ANSI_GRAY << "  Download folder: " << client.getDownloadFolder() << "\n";
+        std::cout << "  Compression: " << (client.isCompressionEnabled() ? "ON" : "OFF") 
+                  << ANSI_RESET << "\n\n";
+        
+        Menu mainMenu("Main Menu");
+        mainMenu.addItem("Connect to Server", "Enter server IP and port");
+        mainMenu.addItem("Browse Files", "View and download available files");
+        mainMenu.addItem("Settings", "Configure client settings");
+        mainMenu.addItem("Exit", "Quit the application");
+        
+        int choice = mainMenu.show();
+        
+        if (choice == -1 || choice == 3) {
+            if (confirmDialog("Are you sure you want to exit?")) {
                 running = false;
-                break;
+            }
+        }
+        else if (choice == 0) {
+            system("cls");
+            std::cout << ANSI_CYAN << "\n╔═══════════════════════════════════════╗\n";
+            std::cout << "║         Connect to Server         ║\n";
+            std::cout << "╚═══════════════════════════════════════╝\n" << ANSI_RESET << "\n";
+            
+            std::cout << "Server IP: ";
+            std::string ip;
+            std::getline(std::cin, ip);
+            
+            std::cout << "Port [8080]: ";
+            std::string portStr;
+            std::getline(std::cin, portStr);
+            int port = portStr.empty() ? 8080 : std::stoi(portStr);
+            
+            client.setServer(ip, port);
+            
+            std::cout << "\nTesting connection... " << std::flush;
+            if (client.testConnection()) {
+                std::cout << ANSI_GREEN << "Success!" << ANSI_RESET << "\n";
+            } else {
+                std::cout << ANSI_YELLOW << "Failed!" << ANSI_RESET << "\n";
+            }
+            std::cout << "\nPress any key to continue...";
+            _getch();
+        }
+        else if (choice == 1) {
+            if (client.getServerIP().empty()) {
+                system("cls");
+                std::cout << ANSI_YELLOW << "\nPlease connect to a server first!\n" << ANSI_RESET;
+                std::cout << "\nPress any key to continue...";
+                _getch();
+                continue;
             }
             
-            default:
-                std::cout << "\nInvalid choice.\n";
+            system("cls");
+            std::cout << ANSI_CYAN << "Fetching file list...\n" << ANSI_RESET;
+            
+            if (!client.listFiles()) {
+                std::cout << ANSI_YELLOW << "\nFailed to retrieve file list.\n" << ANSI_RESET;
+                std::cout << "\nPress any key to continue...";
+                _getch();
+                continue;
+            }
+            
+            int fileIndex = client.showFileMenu();
+            
+            if (fileIndex >= 0) {
+                if (confirmDialog("Download this file?")) {
+                    system("cls");
+                    std::cout << ANSI_CYAN << "\n╔═══════════════════════════════════════╗\n";
+                    std::cout << "║            Downloading            ║\n";
+                    std::cout << "╚═══════════════════════════════════════╝\n" << ANSI_RESET << "\n";
+                    
+                    if (client.downloadByIndex(fileIndex)) {
+                        std::cout << "\n" << ANSI_GREEN << "Download complete!" << ANSI_RESET << "\n";
+                    } else {
+                        std::cout << "\n" << ANSI_YELLOW << "Download failed!" << ANSI_RESET << "\n";
+                    }
+                    
+                    std::cout << "\nPress any key to continue...";
+                    _getch();
+                }
+            }
+        }
+        else if (choice == 2) {
+            bool inSettings = true;
+            
+            while (inSettings) {
+                system("cls");
+                std::cout << ANSI_CYAN << "\n╔═══════════════════════════════════════╗\n";
+                std::cout << "║             Settings              ║\n";
+                std::cout << "╚═══════════════════════════════════════╝\n" << ANSI_RESET << "\n";
+                
+                std::cout << "Current Settings:\n";
+                std::cout << "  Server: " << (client.getServerIP().empty() ? "Not set" : 
+                             client.getServerIP() + ":" + std::to_string(client.getServerPort())) << "\n";
+                std::cout << "  Download Folder: " << client.getDownloadFolder() << "\n";
+                std::cout << "  Compression: " << (client.isCompressionEnabled() ? "ON" : "OFF") << "\n\n";
+                
+                Menu settingsMenu("Settings");
+                settingsMenu.addItem("Change Download Folder", "Set where files are saved");
+                settingsMenu.addItem("Toggle Compression", 
+                                   client.isCompressionEnabled() ? "Currently: ON" : "Currently: OFF");
+                settingsMenu.addItem("Back to Main Menu", "Return to main menu");
+                
+                int settingChoice = settingsMenu.show();
+                
+                if (settingChoice == -1 || settingChoice == 2) {
+                    inSettings = false;
+                }
+                else if (settingChoice == 0) {
+                    system("cls");
+                    std::cout << ANSI_CYAN << "\n╔═══════════════════════════════════════╗\n";
+                    std::cout << "║       Change Download Folder      ║\n";
+                    std::cout << "╚═══════════════════════════════════════╝\n" << ANSI_RESET << "\n";
+                    
+                    std::cout << "Current folder: " << client.getDownloadFolder() << "\n\n";
+                    std::cout << "New download folder: ";
+                    std::string folder;
+                    std::getline(std::cin, folder);
+                    
+                    if (!folder.empty()) {
+                        client.setDownloadFolder(folder);
+                        std::cout << ANSI_GREEN << "\nFolder updated!" << ANSI_RESET << "\n";
+                    }
+                    
+                    std::cout << "\nPress any key to continue...";
+                    _getch();
+                }
+                else if (settingChoice == 1) {
+                    client.toggleCompression();
+                    std::cout << "\nPress any key to continue...";
+                    _getch();
+                }
+            }
         }
     }
+    
+    system("cls");
+    std::cout << ANSI_GREEN << "\nThank you for using File Sharing Client!\n" << ANSI_RESET;
     
     return 0;
 }
